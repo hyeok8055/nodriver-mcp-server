@@ -1,0 +1,8 @@
+﻿{
+  "mcpServers": {
+    "nodriver": {
+      "command": "uv",
+      "args": ["run", "nodriver-mcp"]
+    }
+  }
+}

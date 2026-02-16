@@ -1,0 +1,26 @@
+[project]
+name = "nodriver-mcp-server"
+version = "0.2.0"
+description = "High-flexibility nodriver MCP server for web automation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.6.0",
+    "nodriver>=0.38"
+]
+
+[project.scripts]
+nodriver-mcp = "nodriver_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nodriver_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/nodriver_mcp/**",
+  "README.md",
+]
