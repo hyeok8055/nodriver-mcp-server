@@ -2,19 +2,29 @@
 
 [nodriver](https://github.com/AusaafMohamed/nodriver) 기반 MCP 서버. 브라우저 자동화, 크롤링, CDP 직접 호출을 MCP 프로토콜로 제공합니다.
 
-## Install
+## 요구사항
 
-### GitHub에서 직접 설치 (권장)
+- Chrome / Chromium 브라우저
+- Python >= 3.10
+- [uv](https://docs.astral.sh/uv/) (uvx 포함)
+
+## 설치
+
+### A. uvx로 바로 실행 (설치 불필요, 권장)
 
 ```bash
-# uvx로 바로 실행 (설치 불필요)
 uvx --from git+https://github.com/hyeok8055/nodriver-mcp-server.git nodriver-mcp
-
-# 또는 pip로 설치
-pip install git+https://github.com/hyeok8055/nodriver-mcp-server.git
 ```
 
-### 로컬 개발용
+### B. uv tool install (글로벌 설치)
+
+```bash
+uv tool install git+https://github.com/hyeok8055/nodriver-mcp-server.git
+```
+
+설치 후 `nodriver-mcp` 명령어를 직접 사용할 수 있습니다.
+
+### C. 로컬 개발용
 
 ```bash
 git clone https://github.com/hyeok8055/nodriver-mcp-server.git
@@ -22,9 +32,19 @@ cd nodriver-mcp-server
 uv venv && uv pip install -e .
 ```
 
+## Windows 11 설정 파일 경로
+
+| 도구 | 설정 파일 경로 |
+|------|--------------|
+| Claude Code (글로벌) | `C:\Users\<user>\.claude\settings.json` |
+| Claude Desktop | `C:\Users\<user>\AppData\Roaming\Claude\claude_desktop_config.json` |
+| VSCode | `.vscode\mcp.json` (워크스페이스 루트) |
+| Gemini CLI | `C:\Users\<user>\.gemini\settings.json` |
+| Codex CLI | `C:\Users\<user>\.codex\config.toml` |
+
 ## Claude Code에서 사용
 
-프로젝트 루트에 `.mcp.json`을 생성하거나, 글로벌 설정(`~/.claude/settings.json`)에 추가:
+프로젝트 루트에 `.mcp.json`을 생성하거나, 글로벌 설정(`C:\Users\<user>\.claude\settings.json`)에 추가:
 
 ```json
 {
@@ -37,7 +57,7 @@ uv venv && uv pip install -e .
 }
 ```
 
-또는 로컬 설치 후:
+글로벌 설치(`uv tool install`) 후 사용 시:
 
 ```json
 {
@@ -49,9 +69,11 @@ uv venv && uv pip install -e .
 }
 ```
 
+등록 확인: `claude mcp list`
+
 ## Claude Desktop에서 사용
 
-`claude_desktop_config.json`에 추가:
+`C:\Users\<user>\AppData\Roaming\Claude\claude_desktop_config.json`에 추가:
 
 ```json
 {
@@ -64,15 +86,54 @@ uv venv && uv pip install -e .
 }
 ```
 
-## Run (수동 실행)
+## VSCode에서 사용 (VS Code 1.99+, GitHub Copilot 필요)
 
-```bash
-# 엔트리포인트
-nodriver-mcp
+워크스페이스 루트에 `.vscode/mcp.json` 파일을 생성:
 
-# 또는 모듈 직접 실행
-python -m nodriver_mcp
+```json
+{
+  "servers": {
+    "nodriver": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/hyeok8055/nodriver-mcp-server.git", "nodriver-mcp"]
+    }
+  }
+}
 ```
+
+> **주의**: VSCode는 키 이름이 `servers`입니다 (다른 도구의 `mcpServers`와 다름). `"type": "stdio"` 필드가 필수입니다.
+
+## Gemini CLI에서 사용
+
+`C:\Users\<user>\.gemini\settings.json`에 추가:
+
+```json
+{
+  "mcpServers": {
+    "nodriver": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/hyeok8055/nodriver-mcp-server.git", "nodriver-mcp"]
+    }
+  }
+}
+```
+
+설정 후 Gemini CLI를 재시작하고 `/mcp` 명령으로 연결 상태를 확인하세요.
+
+> **참고**: `uvx`는 `.exe` 파일이므로 Windows에서 `cmd /c` 래퍼 없이 직접 사용할 수 있습니다.
+
+## OpenAI Codex CLI에서 사용
+
+`C:\Users\<user>\.codex\config.toml`에 추가 (TOML 형식):
+
+```toml
+[mcp_servers.nodriver]
+command = "uvx"
+args = ["--from", "git+https://github.com/hyeok8055/nodriver-mcp-server.git", "nodriver-mcp"]
+```
+
+> **주의**: Codex CLI의 Windows 지원은 experimental입니다.
 
 ## 제공 도구 (Tools)
 
@@ -107,11 +168,27 @@ python -m nodriver_mcp
 }
 ```
 
-## 요구사항
+## 문제 해결
 
-- Python >= 3.10
-- Chrome / Chromium 브라우저 설치 필요
+### Chrome을 찾지 못하는 경우
 
-## Notes
+`browser_start_session` 호출 시 `config`에서 Chrome 실행 파일 경로를 직접 지정하세요:
 
-- Chrome 프로세스 실행이 환경 차이로 실패하면 `browser_start_session`의 config에서 Chromium 인자를 조정하세요.
+```json
+{
+  "extra_chromium_args": ["--no-sandbox"],
+  "browser_executable_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+}
+```
+
+### uvx 명령을 찾지 못하는 경우
+
+```bash
+where uvx
+```
+
+로 경로를 확인한 뒤, 설정 파일에서 `"command"` 값을 절대 경로(예: `C:\Users\<user>\.local\bin\uvx.exe`)로 지정하세요.
+
+### Gemini CLI에서 MCP 서버가 인식되지 않는 경우
+
+Gemini CLI 재시작 후 `/mcp` 명령을 실행해 연결 상태를 확인하세요.
