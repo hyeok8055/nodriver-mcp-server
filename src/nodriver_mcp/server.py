@@ -1330,6 +1330,53 @@ async def browser_screenshot(
 
 
 @mcp.tool()
+async def browser_get_url(
+    ctx: Optional[Context],
+    session_id: str,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Get the current URL and page title of the active tab. Call this when you need to know where you are without reading the full page."""
+    await _ctx_info(ctx, "info", f"tool: browser_get_url session={session_id}")
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            url = await _evaluate(rec.tab, "return window.location.href;")
+            title = await _evaluate(rec.tab, "return document.title || '';")
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
+                "url": str(url or ""),
+                "title": str(title or ""),
+            }).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
+async def page_evaluate(
+    ctx: Optional[Context],
+    session_id: str,
+    script: str,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Execute JavaScript in the page and return the result. Use for custom data extraction when snapshot/text tools are insufficient. The script should use 'return' to return a value."""
+    await _ctx_info(ctx, "info", f"tool: page_evaluate session={session_id}")
+    if not script:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "script required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            result = await _evaluate(rec.tab, script)
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"result": _serialize_result(result)}).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
 async def page_get_content(ctx: Optional[Context], session_id: str, tab_id: Optional[str] = None, max_bytes: int = 200000) -> dict[str, Any]:
     await _ctx_info(ctx, "info", f"tool: page_get_content session={session_id}")
     session = await manager.get_session(session_id)
@@ -1451,7 +1498,20 @@ async def page_snapshot(
     selector: Optional[str] = None,
     diff: bool = False,
 ) -> dict[str, Any]:
-    """Get accessibility tree snapshot of the page. filter: 'all'|'interactive'. format: 'compact'|'text'|'json'. diff: only return changes since last snapshot."""
+    """
+    PRIMARY page understanding tool — use this INSTEAD of page_get_content/page_get_html.
+    Returns a compact accessibility tree (5~13x fewer tokens than raw HTML).
+
+    Returned refs like 'e0', 'e1'... can be passed directly to click_by_ref / fill_by_ref / hover_by_ref.
+
+    Parameters:
+    - filter: 'interactive' (buttons/links/inputs only, recommended) | 'all' (full tree)
+    - format: 'compact' (one line per node, default) | 'text' (indented tree) | 'json'
+    - depth: max tree depth to return (omit for full tree)
+    - max_tokens: hard cap on output size (approximate)
+    - selector: filter nodes whose name/role contains this string
+    - diff: True = return only nodes changed since last snapshot (saves tokens after interactions)
+    """
     await _ctx_info(ctx, "info", f"tool: page_snapshot session={session_id}")
     if filter not in ("all", "interactive"):
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "filter must be 'all' or 'interactive'").to_dict()
@@ -1463,13 +1523,19 @@ async def page_snapshot(
     async with session.lock:
         try:
             rec = _find_tab(session, tab_id)
+
+            # Always fetch URL+title so agents know where they are
+            try:
+                current_url = await _evaluate(rec.tab, "return window.location.href;")
+                current_title = await _evaluate(rec.tab, "return document.title || '';")
+            except Exception:
+                current_url, current_title = "", ""
+
             ax_nodes = await _get_ax_tree(rec.tab, depth=depth)
             nodes = _build_snapshot(ax_nodes)
 
             # Apply selector filter if requested
             if selector:
-                # Find matching node by name/role matching selector heuristic (CSS not applicable to AX)
-                # We'll just use it as a name-contains filter
                 nodes = [n for n in nodes if selector.lower() in n.name.lower() or selector.lower() in n.role.lower()]
 
             # Diff mode
@@ -1478,12 +1544,16 @@ async def page_snapshot(
             snapshot = SnapshotResult(nodes=nodes, ref_to_backend={n.ref: n.backend_node_id for n in nodes if n.backend_node_id is not None}, node_hash=snapshot_hash)
             session.snapshot_cache[rec.tab_id] = snapshot
 
+            header = f"[URL] {current_url}\n[Title] {current_title}\n"
+
             if diff and old_snapshot is not None:
                 diff_result = _compute_diff(old_snapshot.nodes, nodes)
                 diff_nodes = diff_result["added"] + [n for n in nodes if any(c["ref"] == n.ref for c in diff_result["changed"])]
                 diff_text = _format_snapshot(diff_nodes, fmt=format, filter_mode=filter, max_depth=depth, max_tokens=max_tokens)
                 return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
-                    "snapshot": diff_text,
+                    "url": str(current_url or ""),
+                    "title": str(current_title or ""),
+                    "snapshot": header + diff_text,
                     "diff": {
                         "added_count": len(diff_result["added"]),
                         "removed_count": len(diff_result["removed"]),
@@ -1496,7 +1566,9 @@ async def page_snapshot(
 
             text = _format_snapshot(nodes, fmt=format, filter_mode=filter, max_depth=depth, max_tokens=max_tokens)
             return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
-                "snapshot": text,
+                "url": str(current_url or ""),
+                "title": str(current_title or ""),
+                "snapshot": header + text,
                 "node_count": len(nodes),
                 "hash": snapshot_hash,
             }).to_dict()
@@ -1528,7 +1600,11 @@ async def click_by_ref(
     ref: str,
     tab_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Click a page element identified by a snapshot ref (e.g. 'e2')."""
+    """
+    Click an element using its snapshot ref (e.g. 'e2').
+    REQUIRES a prior page_snapshot call on the same tab.
+    Prefer this over browser_click_by_selector — more reliable and token-free.
+    """
     await _ctx_info(ctx, "info", f"tool: click_by_ref session={session_id} ref={ref}")
     if not ref:
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
@@ -1559,7 +1635,11 @@ async def fill_by_ref(
     text: str,
     tab_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Fill a text input identified by a snapshot ref (e.g. 'e1') with text."""
+    """
+    Type text into an input/textarea using its snapshot ref (e.g. 'e1').
+    Fires focus, input, and change events so frameworks (React, Vue, Angular) detect the change.
+    REQUIRES a prior page_snapshot call on the same tab.
+    """
     await _ctx_info(ctx, "info", f"tool: fill_by_ref session={session_id} ref={ref}")
     if not ref:
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
@@ -1590,7 +1670,11 @@ async def hover_by_ref(
     ref: str,
     tab_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Hover over a page element identified by a snapshot ref (e.g. 'e3')."""
+    """
+    Move the mouse over an element using its snapshot ref (e.g. 'e3').
+    Triggers mouseover/mouseenter events — useful for revealing dropdown menus.
+    REQUIRES a prior page_snapshot call on the same tab.
+    """
     await _ctx_info(ctx, "info", f"tool: hover_by_ref session={session_id} ref={ref}")
     if not ref:
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
@@ -1938,7 +2022,14 @@ async def browser_block_resources(
     block_images: bool = False,
     custom_patterns: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-    """Block network resources by category or custom URL patterns via CDP Network.setBlockedURLs."""
+    """
+    Block network requests by category before navigating — speeds up page load and reduces noise.
+    Call BEFORE browser_navigate for best effect.
+    - block_ads: blocks Google/Amazon ad networks
+    - block_analytics: blocks GA, GTM, Mixpanel, Hotjar, etc.
+    - block_images: blocks jpg/png/gif/webp (use when you only need text/structure)
+    - custom_patterns: list of URL wildcard patterns e.g. ['*tracker.com*']
+    """
     await _ctx_info(ctx, "info", f"tool: browser_block_resources session={session_id}")
     session = await manager.get_session(session_id)
     if not session:
@@ -1993,7 +2084,23 @@ async def browser_batch_actions(
     actions: Optional[list[dict[str, Any]]] = None,
     stop_on_error: bool = True,
 ) -> dict[str, Any]:
-    """Execute multiple browser actions in a single call. Supported actions: snapshot, click_by_ref, fill_by_ref, hover_by_ref, navigate, wait_for, scroll, press_key, evaluate."""
+    """
+    Execute multiple browser actions in ONE MCP round-trip — the most token-efficient interaction pattern.
+    Use this whenever you need to do 2+ sequential actions.
+
+    Supported action types:
+      {"action": "snapshot", "filter": "interactive", "format": "compact", "diff": false}
+      {"action": "click_by_ref",  "ref": "e2"}
+      {"action": "fill_by_ref",   "ref": "e1", "text": "hello"}
+      {"action": "hover_by_ref",  "ref": "e3"}
+      {"action": "navigate",      "url": "https://...", "timeout_ms": 20000}
+      {"action": "wait_for",      "selector": "...", "timeout": 10}
+      {"action": "scroll",        "direction": "down", "amount": 800}
+      {"action": "press_key",     "key": "Enter"}
+      {"action": "evaluate",      "script": "return document.title"}
+
+    stop_on_error: if True (default), stops on first failure and returns partial results.
+    """
     await _ctx_info(ctx, "info", f"tool: browser_batch_actions session={session_id}")
     if not actions:
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "actions list required").to_dict()
@@ -2141,7 +2248,12 @@ async def browser_humanlike_click(
     steps: int = 15,
     button: str = "left",
 ) -> dict[str, Any]:
-    """Click using a realistic Bezier-curve mouse path with randomized offset and timing. Specify target via selector, ref, or x/y coordinates."""
+    """
+    Click an element using a realistic Bezier-curve mouse path with randomized offset and press timing.
+    More human-like than click_by_ref — use for sites with advanced bot detection.
+    Specify target via: selector (CSS), ref (snapshot ref), or x/y (absolute coordinates).
+    steps: number of mouse-move events along the path (5-30, default 15).
+    """
     await _ctx_info(ctx, "info", f"tool: browser_humanlike_click session={session_id}")
     if not selector and not ref and (x is None or y is None):
         return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "selector, ref, or x/y required").to_dict()
@@ -2293,6 +2405,250 @@ async def resource_sessions_network_events(session_id: str) -> str:
         return json.dumps({"ok": False, "error": "session not found"}, ensure_ascii=False)
     async with session.lock:
         return json.dumps({"ok": True, "events": list(session.event_buffer)}, ensure_ascii=False)
+
+
+@mcp.prompt()
+def agent_system_prompt() -> str:
+    """
+    Load this as your system prompt when using the nodriver browser MCP server.
+    Provides optimal tool-selection rules and workflow patterns for maximum efficiency.
+    """
+    return """\
+# Browser Automation Agent — System Prompt
+
+You control a real Chrome browser via nodriver MCP tools.
+Your primary goal: accomplish browser tasks with MINIMUM token consumption.
+
+---
+
+## GOLDEN RULE: page_snapshot FIRST, ALWAYS
+
+After every navigation or major interaction, call:
+
+    page_snapshot(filter="interactive", format="compact")
+
+This returns a compact accessibility tree like:
+
+    [URL] https://example.com/search
+    [Title] Example Search
+    e0 link 'Home' [focusable]
+    e1 textbox 'Search' val='' [focusable,editable]
+    e2 button 'Submit' [focusable]
+    e3 link 'Sign in' [focusable]
+
+The refs (e0, e1 ...) are your handles for all interactions.
+This costs ~50-500 tokens. Raw HTML costs 5,000-50,000 tokens.
+
+---
+
+## TOOL SELECTION DECISION TREE
+
+### Understanding page structure
+    ✅ page_snapshot(filter="interactive", format="compact")   ← ALWAYS start here
+    ✅ page_snapshot(filter="all")                             ← when you need full tree
+    ⚠️  page_get_text()                                        ← only for article/prose content
+    ⚠️  page_get_links()                                       ← only for link harvesting
+    ❌ page_get_html()                                         ← avoid; use only for 1 specific element
+    ❌ page_get_content()                                      ← last resort; very expensive
+
+### Clicking / interacting with elements
+    ✅ click_by_ref(ref="e2")                   ← preferred; requires prior snapshot
+    ✅ fill_by_ref(ref="e1", text="value")       ← preferred; fires React/Vue/Angular events
+    ✅ hover_by_ref(ref="e3")                    ← for dropdowns; requires prior snapshot
+    ⚠️  browser_click_by_selector(selector=".x") ← fallback if snapshot fails
+    ⚠️  browser_humanlike_click(ref="e2")        ← only for aggressive bot-detection sites
+
+### Multiple sequential actions
+    ✅ browser_batch_actions([...])  ← 1 MCP call for N actions; ALWAYS prefer this
+    ❌ Separate tool calls           ← N MCP calls; avoid when batch works
+
+### Seeing what changed after an action
+    ✅ page_snapshot(diff=True)   ← returns only changed/new elements (~10x cheaper)
+    ❌ page_snapshot()             ← full re-scan; only if diff is insufficient
+
+### Faster / cheaper page loads
+    ✅ browser_block_resources(block_ads=True, block_analytics=True)  ← run BEFORE navigate
+    ✅ browser_block_resources(block_images=True)  ← add this when you only need text/structure
+
+---
+
+## OPTIMAL INTERACTION PATTERN
+
+```
+Step 1 [once per domain]:
+  browser_block_resources(block_ads=True, block_analytics=True)
+
+Step 2:
+  browser_navigate(url="https://target.com")
+
+Step 3:
+  page_snapshot(filter="interactive", format="compact")
+  → read refs from output
+
+Step 4 [batch everything]:
+  browser_batch_actions([
+    {"action": "fill_by_ref",  "ref": "e1",  "text": "my query"},
+    {"action": "click_by_ref", "ref": "e2"},
+    {"action": "snapshot",     "filter": "interactive", "diff": true}
+  ])
+
+Step 5 [only if needed]:
+  browser_screenshot()   ← visual check or when AX tree is sparse
+```
+
+---
+
+## WORKFLOW PATTERNS
+
+### Login
+```
+page_snapshot(filter="interactive")
+→ find username ref, password ref, submit ref
+browser_batch_actions([
+  {fill_by_ref username},
+  {fill_by_ref password},
+  {click_by_ref submit},
+  {snapshot diff:true}
+])
+→ verify login success from diff
+```
+
+### Search & Extract
+```
+page_snapshot(filter="interactive") → find search box
+browser_batch_actions([
+  {fill_by_ref search_box, text: query},
+  {click_by_ref search_btn},
+  {snapshot filter:"all"}
+])
+→ extract results from snapshot
+```
+
+### Multi-page Crawl
+```
+browser_block_resources(block_ads=True, block_analytics=True, block_images=True)
+loop:
+  browser_navigate(url)
+  page_snapshot(filter="all", format="compact")
+  → parse data from snapshot
+  → find next-page link ref → click_by_ref
+```
+
+### Form Fill
+```
+page_snapshot(filter="interactive")
+→ map all form field refs
+browser_batch_actions([
+  {fill each field},
+  {click submit},
+  {wait_for selector: ".success"},
+  {snapshot diff:true}
+])
+```
+
+### Debug / Inspect
+```
+page_snapshot(filter="all", format="text")  ← indented tree shows structure
+page_evaluate(script="return document.querySelectorAll('form').length")
+browser_capture_console()
+```
+
+---
+
+## WHEN TO USE FALLBACK TOOLS
+
+| Situation | Tool |
+|---|---|
+| Need raw article text | page_get_text() |
+| Need all hyperlinks | page_get_links() |
+| AX tree empty (canvas app) | page_get_content() + browser_screenshot() |
+| Need custom JS result | page_evaluate(script="return ...") |
+| Need current URL/title only | browser_get_url() |
+| Visual verification needed | browser_screenshot() |
+| Site has aggressive bot detection | browser_humanlike_click() |
+
+---
+
+## SESSION RULES
+
+- Always call browser_start_session() once at the start → save session_id
+- Always call browser_stop_session(session_id) when done
+- Snapshot refs are invalidated after navigate/refresh — re-snapshot after navigation
+- browser_block_resources persists for the session; set it once
+"""
+
+
+@mcp.prompt()
+def workflow_scrape(url: str, fields: Optional[str] = None) -> str:
+    """Optimized scraping workflow prompt. Provide target URL and comma-separated fields to extract."""
+    fields_text = fields or "title, content, links, metadata"
+    return f"""\
+# Scraping Task
+
+Target URL: {url}
+Fields to extract: {fields_text}
+
+## Execution Plan
+
+1. browser_block_resources(block_ads=True, block_analytics=True, block_images=True)
+   → Disable trackers and images for faster load
+
+2. browser_navigate(url="{url}")
+
+3. page_snapshot(filter="all", format="compact")
+   → Understand page structure, note content areas
+
+4. Extract data using targeted tools:
+   - page_get_text(selector="article") for prose content
+   - page_get_links() for all hyperlinks
+   - page_evaluate(script="...") for structured/JS-rendered data
+
+5. If paginated: find next-page ref via snapshot → click_by_ref → repeat from step 3
+
+## Output format
+Return a structured JSON object with the requested fields.
+Validate each field is non-empty before returning.
+"""
+
+
+@mcp.prompt()
+def workflow_automate(task: str, url: str) -> str:
+    """Optimized web automation workflow prompt for form-filling, login, or multi-step tasks."""
+    return f"""\
+# Automation Task
+
+Task: {task}
+Starting URL: {url}
+
+## Execution Plan
+
+1. browser_start_session()  [if not already started]
+
+2. browser_block_resources(block_ads=True, block_analytics=True)
+
+3. browser_navigate(url="{url}")
+
+4. page_snapshot(filter="interactive", format="compact")
+   → Identify all interactive elements and their refs (e0, e1, ...)
+   → Map refs to their purpose (login fields, buttons, dropdowns, etc.)
+
+5. browser_batch_actions([...all steps...])
+   → Fill all inputs via fill_by_ref
+   → Click buttons via click_by_ref
+   → Include snapshot(diff:true) as last action to verify result
+
+6. Verify success:
+   - Check diff snapshot for confirmation messages / URL change
+   - If needed: browser_screenshot() for visual confirmation
+
+## Error recovery
+If a step fails:
+- Re-run page_snapshot(filter="interactive") to get fresh refs
+- Check if the page changed unexpectedly
+- Try browser_wait_for(selector=".expected-element") before retrying
+
+Task: {task}
+"""
 
 
 @mcp.prompt()
