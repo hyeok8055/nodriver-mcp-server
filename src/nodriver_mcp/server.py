@@ -5,8 +5,11 @@ Nodriver 기반 MCP 서버 v2 (실행 구현).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
+import random
 import re
 import shutil
 import sys
@@ -16,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Optional, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Union
 
 import nodriver as uc
 from nodriver.core.connection import ProtocolException
@@ -37,6 +40,7 @@ ALLOWED_CDP_DOMAINS = {
     "Security",
     "Log",
     "Target",
+    "Accessibility",
 }
 
 CDP_MODULE_EVENTS = {
@@ -220,6 +224,28 @@ class TabRecord:
 
 
 @dataclass
+class A11yNodeInfo:
+    ref: str
+    role: str
+    name: str
+    value: str
+    node_id: str
+    backend_node_id: Optional[int]
+    properties: Dict[str, Any]
+    depth: int
+    child_refs: List[str]
+    parent_ref: Optional[str]
+
+
+@dataclass
+class SnapshotResult:
+    nodes: List[A11yNodeInfo]
+    ref_to_backend: Dict[str, int]
+    node_hash: str
+    captured_at: datetime = field(default_factory=_utcnow)
+
+
+@dataclass
 class BrowserSession:
     session_id: str
     config: SessionConfig
@@ -235,6 +261,7 @@ class BrowserSession:
     last_used_at: datetime = field(default_factory=_utcnow)
     network_capture_active: bool = False
     network_capture_settings: Dict[str, Any] = field(default_factory=dict)
+    snapshot_cache: Dict[str, SnapshotResult] = field(default_factory=dict)
 
     def touch(self) -> None:
         self.last_used_at = _utcnow()
@@ -573,6 +600,221 @@ async def _ctx_progress(ctx: Optional[Context], current: int, total: int, messag
         await result
 
 
+# ── Accessibility tree helpers ─────────────────────────────────────────────
+
+_INTERACTIVE_ROLES = {
+    "button", "link", "textbox", "searchbox", "combobox", "listbox",
+    "checkbox", "radio", "menuitem", "tab", "slider", "spinbutton",
+    "switch", "menuitemcheckbox", "menuitemradio", "treeitem", "option",
+    "row", "gridcell", "select", "generic",
+}
+
+_PROPERTY_NAMES = {
+    "focusable", "focused", "editable", "settable", "multiline", "multiselectable",
+    "required", "selected", "checked", "expanded", "disabled", "busy",
+    "live", "atomic", "relevant", "modal", "haspopup", "invalid", "keyshortcuts",
+    "roledescription", "autocomplete", "placeholder",
+}
+
+
+def _ax_value_str(val: Any) -> str:
+    """Extract a plain string from an AXValue object."""
+    if val is None:
+        return ""
+    if hasattr(val, "value") and val.value is not None:
+        return str(val.value)
+    return ""
+
+
+def _ax_node_properties(node: Any) -> Dict[str, Any]:
+    """Extract relevant properties from an AXNode into a plain dict."""
+    props: Dict[str, Any] = {}
+    if not node.properties:
+        return props
+    for prop in node.properties:
+        name = str(prop.name.value) if hasattr(prop.name, "value") else str(prop.name)
+        val = _ax_value_str(prop.value)
+        if name in _PROPERTY_NAMES and val and val not in ("false", "none", ""):
+            props[name] = val if val != "true" else True
+    return props
+
+
+async def _get_ax_tree(tab: Any, depth: Optional[int] = None) -> List[Any]:
+    """Enable Accessibility CDP domain and fetch full AX tree."""
+    import nodriver.cdp.accessibility as cdp_ax
+    send = getattr(tab, "send", None)
+    if not callable(send):
+        raise RuntimeError("tab.send not available")
+    await _safe_call(send, cdp_ax.enable())
+    nodes = await _safe_call(send, cdp_ax.get_full_ax_tree(depth=depth))
+    return nodes or []
+
+
+def _build_snapshot(ax_nodes: List[Any]) -> List[A11yNodeInfo]:
+    """Convert a flat list of AXNode objects into A11yNodeInfo list with stable refs."""
+    # Build id→node map
+    id_map: Dict[str, Any] = {}
+    for n in ax_nodes:
+        id_map[str(n.node_id)] = n
+
+    # BFS from roots (nodes without parent_id or whose parent is not in tree)
+    root_ids = [str(n.node_id) for n in ax_nodes if not n.parent_id or str(n.parent_id) not in id_map]
+
+    result: List[A11yNodeInfo] = []
+    ref_counter = 0
+    node_id_to_ref: Dict[str, str] = {}
+
+    queue: List[tuple] = [(nid, 0, None) for nid in root_ids]
+    visited: set = set()
+
+    while queue:
+        node_id, depth, parent_ref = queue.pop(0)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        node = id_map.get(node_id)
+        if node is None:
+            continue
+
+        if node.ignored:
+            # Still process children for ignored containers
+            child_ids = [str(c) for c in (node.child_ids or [])]
+            for cid in child_ids:
+                queue.append((cid, depth, parent_ref))
+            continue
+
+        role = _ax_value_str(node.role) or "generic"
+        name = _ax_value_str(node.name)
+        value = _ax_value_str(node.value)
+        props = _ax_node_properties(node)
+
+        ref = f"e{ref_counter}"
+        ref_counter += 1
+        node_id_to_ref[node_id] = ref
+
+        child_ids = [str(c) for c in (node.child_ids or [])]
+        child_refs: List[str] = []  # filled in second pass
+
+        backend_node_id = int(node.backend_dom_node_id) if node.backend_dom_node_id is not None else None
+
+        result.append(A11yNodeInfo(
+            ref=ref,
+            role=role,
+            name=name,
+            value=value,
+            node_id=node_id,
+            backend_node_id=backend_node_id,
+            properties=props,
+            depth=depth,
+            child_refs=child_refs,
+            parent_ref=parent_ref,
+        ))
+
+        for cid in child_ids:
+            queue.append((cid, depth + 1, ref))
+
+    # Resolve child_refs (second pass)
+    ref_map = {info.node_id: info.ref for info in result}
+    id_to_children: Dict[str, List[str]] = {}
+    for n in ax_nodes:
+        nid = str(n.node_id)
+        if not n.ignored and nid in ref_map:
+            for cid in (n.child_ids or []):
+                cref = ref_map.get(str(cid))
+                if cref:
+                    id_to_children.setdefault(nid, []).append(cref)
+    for info in result:
+        info.child_refs = id_to_children.get(info.node_id, [])
+
+    return result
+
+
+def _compute_node_hash(nodes: List[A11yNodeInfo]) -> str:
+    digest_input = "|".join(f"{n.ref}:{n.role}:{n.name}:{n.value}" for n in nodes)
+    return hashlib.md5(digest_input.encode("utf-8")).hexdigest()
+
+
+def _compute_diff(old_nodes: List[A11yNodeInfo], new_nodes: List[A11yNodeInfo]) -> Dict[str, Any]:
+    old_map = {n.ref: n for n in old_nodes}
+    new_map = {n.ref: n for n in new_nodes}
+    old_keys = set(old_map)
+    new_keys = set(new_map)
+
+    added = [n for r, n in new_map.items() if r not in old_keys]
+    removed = [r for r in old_keys if r not in new_keys]
+    changed = []
+    for ref in old_keys & new_keys:
+        o, nw = old_map[ref], new_map[ref]
+        if o.role != nw.role or o.name != nw.name or o.value != nw.value or o.properties != nw.properties:
+            changed.append({"ref": ref, "before": {"role": o.role, "name": o.name, "value": o.value}, "after": {"role": nw.role, "name": nw.name, "value": nw.value}})
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+def _format_snapshot(
+    nodes: List[A11yNodeInfo],
+    fmt: str = "compact",
+    filter_mode: str = "all",
+    max_depth: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+) -> str:
+    filtered: List[A11yNodeInfo] = []
+    for n in nodes:
+        if filter_mode == "interactive" and n.role not in _INTERACTIVE_ROLES:
+            continue
+        if max_depth is not None and n.depth > max_depth:
+            continue
+        filtered.append(n)
+
+    if fmt == "json":
+        out = []
+        for n in filtered:
+            entry: Dict[str, Any] = {"ref": n.ref, "role": n.role}
+            if n.name:
+                entry["name"] = n.name
+            if n.value:
+                entry["value"] = n.value
+            if n.properties:
+                entry["properties"] = n.properties
+            if n.child_refs:
+                entry["children"] = n.child_refs
+            out.append(entry)
+        text = json.dumps(out, ensure_ascii=False)
+    elif fmt == "text":
+        lines = []
+        for n in filtered:
+            indent = "  " * n.depth
+            parts = [f"{n.ref} {n.role}"]
+            if n.name:
+                parts.append(f"'{n.name}'")
+            if n.value:
+                parts.append(f"val={n.value!r}")
+            if n.properties:
+                flags = ",".join(str(k) for k in n.properties)
+                parts.append(f"[{flags}]")
+            lines.append(indent + " ".join(parts))
+        text = "\n".join(lines)
+    else:  # compact
+        lines = []
+        for n in filtered:
+            parts = [f"{n.ref} {n.role}"]
+            if n.name:
+                parts.append(f"'{n.name}'")
+            if n.value:
+                parts.append(f"val={n.value!r}")
+            if n.properties:
+                flags = ",".join(str(k) for k in n.properties)
+                parts.append(f"[{flags}]")
+            lines.append(" ".join(parts))
+        text = "\n".join(lines)
+
+    if max_tokens is not None:
+        # Rough token estimate: 1 token ≈ 4 chars
+        char_limit = max_tokens * 4
+        if len(text) > char_limit:
+            text = text[:char_limit] + "\n...(truncated)"
+    return text
+
+
 manager = BrowserManager()
 @mcp.tool()
 async def browser_start_session(ctx: Optional[Context], config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -674,6 +916,7 @@ async def browser_close_tab(ctx: Optional[Context], session_id: str, tab_id: str
         rec = session.tabs.pop(tab_id, None)
         if rec is None:
             return ToolResult.fail(session_id, tab_id, ErrorCodes.TAB_NOT_FOUND, "tab not found").to_dict()
+        session.snapshot_cache.pop(tab_id, None)
         try:
             await _safe_call(rec.tab.close)
         except Exception:
@@ -736,6 +979,7 @@ async def browser_navigate(
 
         try:
             await _navigate(rec.tab, url, timeout_ms=timeout_ms)
+            session.snapshot_cache.pop(rec.tab_id, None)
             return ToolResult(
                 ok=True,
                 session_id=session_id,
@@ -744,6 +988,7 @@ async def browser_navigate(
                 elapsed_ms=int((_utcnow() - start).total_seconds() * 1000),
             ).to_dict()
         except asyncio.TimeoutError:
+            session.snapshot_cache.pop(rec.tab_id, None)
             return ToolResult.fail(session_id, rec.tab_id, ErrorCodes.TIMEOUT, "navigation timeout").to_dict()
         except Exception as exc:
             return ToolResult.fail(session_id, rec.tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
@@ -796,6 +1041,7 @@ async def browser_refresh(ctx: Optional[Context], session_id: str, tab_id: Optio
                     await _safe_call(fn)
             else:
                 await _safe_call(rec.tab.get, rec.tab.url)
+            session.snapshot_cache.pop(rec.tab_id, None)
             return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"ignore_cache": ignore_cache}).to_dict()
         except Exception as exc:
             return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
@@ -1194,6 +1440,180 @@ async def page_get_resources(
 
 
 @mcp.tool()
+async def page_snapshot(
+    ctx: Optional[Context],
+    session_id: str,
+    tab_id: Optional[str] = None,
+    filter: str = "all",
+    format: str = "compact",
+    depth: Optional[int] = None,
+    max_tokens: Optional[int] = None,
+    selector: Optional[str] = None,
+    diff: bool = False,
+) -> dict[str, Any]:
+    """Get accessibility tree snapshot of the page. filter: 'all'|'interactive'. format: 'compact'|'text'|'json'. diff: only return changes since last snapshot."""
+    await _ctx_info(ctx, "info", f"tool: page_snapshot session={session_id}")
+    if filter not in ("all", "interactive"):
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "filter must be 'all' or 'interactive'").to_dict()
+    if format not in ("compact", "text", "json"):
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "format must be 'compact', 'text', or 'json'").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            ax_nodes = await _get_ax_tree(rec.tab, depth=depth)
+            nodes = _build_snapshot(ax_nodes)
+
+            # Apply selector filter if requested
+            if selector:
+                # Find matching node by name/role matching selector heuristic (CSS not applicable to AX)
+                # We'll just use it as a name-contains filter
+                nodes = [n for n in nodes if selector.lower() in n.name.lower() or selector.lower() in n.role.lower()]
+
+            # Diff mode
+            old_snapshot = session.snapshot_cache.get(rec.tab_id)
+            snapshot_hash = _compute_node_hash(nodes)
+            snapshot = SnapshotResult(nodes=nodes, ref_to_backend={n.ref: n.backend_node_id for n in nodes if n.backend_node_id is not None}, node_hash=snapshot_hash)
+            session.snapshot_cache[rec.tab_id] = snapshot
+
+            if diff and old_snapshot is not None:
+                diff_result = _compute_diff(old_snapshot.nodes, nodes)
+                diff_nodes = diff_result["added"] + [n for n in nodes if any(c["ref"] == n.ref for c in diff_result["changed"])]
+                diff_text = _format_snapshot(diff_nodes, fmt=format, filter_mode=filter, max_depth=depth, max_tokens=max_tokens)
+                return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
+                    "snapshot": diff_text,
+                    "diff": {
+                        "added_count": len(diff_result["added"]),
+                        "removed_count": len(diff_result["removed"]),
+                        "changed_count": len(diff_result["changed"]),
+                        "removed_refs": diff_result["removed"],
+                    },
+                    "node_count": len(nodes),
+                    "hash": snapshot_hash,
+                }).to_dict()
+
+            text = _format_snapshot(nodes, fmt=format, filter_mode=filter, max_depth=depth, max_tokens=max_tokens)
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
+                "snapshot": text,
+                "node_count": len(nodes),
+                "hash": snapshot_hash,
+            }).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+async def _resolve_ref(session: "BrowserSession", tab_id: str, ref: str, tab: Any) -> Any:
+    """Resolve a snapshot ref to a JS RemoteObject via DOM.resolveNode."""
+    snapshot = session.snapshot_cache.get(tab_id)
+    if snapshot is None:
+        raise RuntimeError("no snapshot for tab — call page_snapshot first")
+    backend_node_id = snapshot.ref_to_backend.get(ref)
+    if backend_node_id is None:
+        raise RuntimeError(f"ref '{ref}' not found in snapshot")
+    import nodriver.cdp.dom as cdp_dom
+    import nodriver.cdp.runtime as cdp_runtime
+    send = getattr(tab, "send", None)
+    if not callable(send):
+        raise RuntimeError("tab.send not available")
+    remote_obj = await _safe_call(send, cdp_dom.resolve_node(backend_node_id=cdp_dom.BackendNodeId(backend_node_id)))
+    return remote_obj
+
+
+@mcp.tool()
+async def click_by_ref(
+    ctx: Optional[Context],
+    session_id: str,
+    ref: str,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Click a page element identified by a snapshot ref (e.g. 'e2')."""
+    await _ctx_info(ctx, "info", f"tool: click_by_ref session={session_id} ref={ref}")
+    if not ref:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+            import nodriver.cdp.runtime as cdp_runtime
+            send = getattr(rec.tab, "send", None)
+            await _safe_call(send, cdp_runtime.call_function_on(
+                function_declaration="function(){this.click()}",
+                object_id=remote_obj.object_id,
+                user_gesture=True,
+            ))
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"ref": ref, "action": "click"}).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
+async def fill_by_ref(
+    ctx: Optional[Context],
+    session_id: str,
+    ref: str,
+    text: str,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Fill a text input identified by a snapshot ref (e.g. 'e1') with text."""
+    await _ctx_info(ctx, "info", f"tool: fill_by_ref session={session_id} ref={ref}")
+    if not ref:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+            import nodriver.cdp.runtime as cdp_runtime
+            send = getattr(rec.tab, "send", None)
+            safe_text = json.dumps(text)
+            await _safe_call(send, cdp_runtime.call_function_on(
+                function_declaration=f"function(){{this.focus();this.value={safe_text};this.dispatchEvent(new Event('input',{{bubbles:true}}));this.dispatchEvent(new Event('change',{{bubbles:true}}));}}",
+                object_id=remote_obj.object_id,
+                user_gesture=True,
+            ))
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"ref": ref, "text": text}).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
+async def hover_by_ref(
+    ctx: Optional[Context],
+    session_id: str,
+    ref: str,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Hover over a page element identified by a snapshot ref (e.g. 'e3')."""
+    await _ctx_info(ctx, "info", f"tool: hover_by_ref session={session_id} ref={ref}")
+    if not ref:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "ref required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+            import nodriver.cdp.runtime as cdp_runtime
+            send = getattr(rec.tab, "send", None)
+            await _safe_call(send, cdp_runtime.call_function_on(
+                function_declaration="function(){this.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));this.dispatchEvent(new MouseEvent('mouseenter',{bubbles:false}));}",
+                object_id=remote_obj.object_id,
+                user_gesture=True,
+            ))
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"ref": ref, "action": "hover"}).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
 async def page_set_local_storage(ctx: Optional[Context], session_id: str, tab_id: Optional[str] = None, storage: dict[str, str] = None) -> dict[str, Any]:
     await _ctx_info(ctx, "info", f"tool: page_set_local_storage session={session_id}")
     if storage is None:
@@ -1506,6 +1926,318 @@ async def browser_healthcheck(ctx: Optional[Context], session_id: str) -> dict[s
         rec = _find_tab(session, None)
         await _evaluate(rec.tab, "return 1+1;")
         return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={"summary": _session_summary(session)}).to_dict()
+
+
+@mcp.tool()
+async def browser_block_resources(
+    ctx: Optional[Context],
+    session_id: str,
+    tab_id: Optional[str] = None,
+    block_ads: bool = False,
+    block_analytics: bool = False,
+    block_images: bool = False,
+    custom_patterns: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Block network resources by category or custom URL patterns via CDP Network.setBlockedURLs."""
+    await _ctx_info(ctx, "info", f"tool: browser_block_resources session={session_id}")
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+
+    patterns: list[str] = []
+    if block_ads:
+        patterns.extend([
+            "*doubleclick.net*", "*googlesyndication.com*", "*googleadservices.com*",
+            "*adservice.google.*", "*amazon-adsystem.com*", "*adsafeprotected.com*",
+            "*adnxs.com*", "*taboola.com*", "*outbrain.com*", "*moatads.com*",
+        ])
+    if block_analytics:
+        patterns.extend([
+            "*google-analytics.com/analytics.js*", "*google-analytics.com/gtag*",
+            "*googletagmanager.com/gtm.js*", "*mixpanel.com*", "*segment.io*",
+            "*segment.com*", "*hotjar.com*", "*fullstory.com*", "*heap.io*",
+            "*analytics.js*", "*clarity.ms*",
+        ])
+    if block_images:
+        patterns.extend(["*.jpg*", "*.jpeg*", "*.png*", "*.gif*", "*.webp*", "*.svg*", "*.ico*"])
+    if custom_patterns:
+        patterns.extend(custom_patterns)
+
+    if not patterns:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "no block patterns specified").to_dict()
+
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            import nodriver.cdp.network as cdp_network
+            send = getattr(rec.tab, "send", None)
+            if not callable(send):
+                raise RuntimeError("tab.send not available")
+            await _safe_call(send, cdp_network.enable())
+            await _safe_call(send, cdp_network.set_blocked_ur_ls(urls=patterns))
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
+                "blocked_patterns": patterns,
+                "block_ads": block_ads,
+                "block_analytics": block_analytics,
+                "block_images": block_images,
+            }).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
+
+
+@mcp.tool()
+async def browser_batch_actions(
+    ctx: Optional[Context],
+    session_id: str,
+    tab_id: Optional[str] = None,
+    actions: Optional[list[dict[str, Any]]] = None,
+    stop_on_error: bool = True,
+) -> dict[str, Any]:
+    """Execute multiple browser actions in a single call. Supported actions: snapshot, click_by_ref, fill_by_ref, hover_by_ref, navigate, wait_for, scroll, press_key, evaluate."""
+    await _ctx_info(ctx, "info", f"tool: browser_batch_actions session={session_id}")
+    if not actions:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "actions list required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+
+    results: list[dict[str, Any]] = []
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+        except KeyError as exc:
+            return ToolResult.fail(session_id, tab_id, ErrorCodes.TAB_NOT_FOUND, str(exc)).to_dict()
+
+        for i, action_spec in enumerate(actions):
+            action = action_spec.get("action", "")
+            try:
+                if action == "snapshot":
+                    ax_nodes = await _get_ax_tree(rec.tab, depth=action_spec.get("depth"))
+                    nodes = _build_snapshot(ax_nodes)
+                    snapshot_hash = _compute_node_hash(nodes)
+                    old_snapshot = session.snapshot_cache.get(rec.tab_id)
+                    snapshot = SnapshotResult(nodes=nodes, ref_to_backend={n.ref: n.backend_node_id for n in nodes if n.backend_node_id is not None}, node_hash=snapshot_hash)
+                    session.snapshot_cache[rec.tab_id] = snapshot
+                    fmt = action_spec.get("format", "compact")
+                    filter_mode = action_spec.get("filter", "all")
+                    use_diff = action_spec.get("diff", False) and old_snapshot is not None
+                    if use_diff:
+                        diff_data = _compute_diff(old_snapshot.nodes, nodes)
+                        diff_nodes = diff_data["added"] + [n for n in nodes if any(c["ref"] == n.ref for c in diff_data["changed"])]
+                        text = _format_snapshot(diff_nodes, fmt=fmt, filter_mode=filter_mode)
+                        results.append({"action": action, "index": i, "ok": True, "snapshot": text, "diff": True})
+                    else:
+                        text = _format_snapshot(nodes, fmt=fmt, filter_mode=filter_mode, max_tokens=action_spec.get("max_tokens"))
+                        results.append({"action": action, "index": i, "ok": True, "snapshot": text, "node_count": len(nodes)})
+
+                elif action == "click_by_ref":
+                    ref = action_spec.get("ref", "")
+                    remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+                    import nodriver.cdp.runtime as cdp_runtime
+                    send = getattr(rec.tab, "send", None)
+                    await _safe_call(send, cdp_runtime.call_function_on(
+                        function_declaration="function(){this.click()}",
+                        object_id=remote_obj.object_id,
+                        user_gesture=True,
+                    ))
+                    results.append({"action": action, "index": i, "ok": True, "ref": ref})
+
+                elif action == "fill_by_ref":
+                    ref = action_spec.get("ref", "")
+                    text = action_spec.get("text", "")
+                    remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+                    import nodriver.cdp.runtime as cdp_runtime
+                    send = getattr(rec.tab, "send", None)
+                    safe_text = json.dumps(text)
+                    await _safe_call(send, cdp_runtime.call_function_on(
+                        function_declaration=f"function(){{this.focus();this.value={safe_text};this.dispatchEvent(new Event('input',{{bubbles:true}}));this.dispatchEvent(new Event('change',{{bubbles:true}}));}}",
+                        object_id=remote_obj.object_id,
+                        user_gesture=True,
+                    ))
+                    results.append({"action": action, "index": i, "ok": True, "ref": ref, "text": text})
+
+                elif action == "hover_by_ref":
+                    ref = action_spec.get("ref", "")
+                    remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+                    import nodriver.cdp.runtime as cdp_runtime
+                    send = getattr(rec.tab, "send", None)
+                    await _safe_call(send, cdp_runtime.call_function_on(
+                        function_declaration="function(){this.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));}",
+                        object_id=remote_obj.object_id,
+                        user_gesture=True,
+                    ))
+                    results.append({"action": action, "index": i, "ok": True, "ref": ref})
+
+                elif action == "navigate":
+                    url = action_spec.get("url", "")
+                    timeout_ms = action_spec.get("timeout_ms", 20000)
+                    await _navigate(rec.tab, url, timeout_ms=timeout_ms)
+                    session.snapshot_cache.pop(rec.tab_id, None)
+                    results.append({"action": action, "index": i, "ok": True, "url": url})
+
+                elif action == "wait_for":
+                    selector = action_spec.get("selector", "")
+                    text = action_spec.get("text", "")
+                    timeout = action_spec.get("timeout", 10)
+                    if selector:
+                        await _select_element(rec.tab, selector, timeout * 1000)
+                    elif text:
+                        await _find_text(rec.tab, text, timeout * 1000)
+                    results.append({"action": action, "index": i, "ok": True})
+
+                elif action == "scroll":
+                    direction = action_spec.get("direction", "down")
+                    amount = action_spec.get("amount", 800)
+                    scripts = {
+                        "up": f"window.scrollBy(0,{-amount});",
+                        "down": f"window.scrollBy(0,{amount});",
+                        "left": f"window.scrollBy({-amount},0);",
+                        "right": f"window.scrollBy({amount},0);",
+                        "top": "window.scrollTo(0,0);",
+                        "bottom": "window.scrollTo(0,document.body.scrollHeight);",
+                    }
+                    await _evaluate(rec.tab, scripts.get(direction, scripts["down"]))
+                    results.append({"action": action, "index": i, "ok": True, "direction": direction})
+
+                elif action == "press_key":
+                    key = action_spec.get("key", "")
+                    if hasattr(rec.tab, "send_keys"):
+                        await _safe_call(rec.tab.send_keys, key)
+                    results.append({"action": action, "index": i, "ok": True, "key": key})
+
+                elif action == "evaluate":
+                    script = action_spec.get("script", "")
+                    res = await _evaluate(rec.tab, script)
+                    results.append({"action": action, "index": i, "ok": True, "result": _serialize_result(res)})
+
+                else:
+                    results.append({"action": action, "index": i, "ok": False, "error": f"unknown action: {action}"})
+                    if stop_on_error:
+                        break
+
+            except Exception as exc:
+                results.append({"action": action, "index": i, "ok": False, "error": str(exc)})
+                if stop_on_error:
+                    break
+
+    succeeded = sum(1 for r in results if r.get("ok"))
+    return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id if "rec" in locals() else tab_id, data={
+        "results": results,
+        "total": len(actions),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+    }).to_dict()
+
+
+@mcp.tool()
+async def browser_humanlike_click(
+    ctx: Optional[Context],
+    session_id: str,
+    tab_id: Optional[str] = None,
+    selector: Optional[str] = None,
+    ref: Optional[str] = None,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    steps: int = 15,
+    button: str = "left",
+) -> dict[str, Any]:
+    """Click using a realistic Bezier-curve mouse path with randomized offset and timing. Specify target via selector, ref, or x/y coordinates."""
+    await _ctx_info(ctx, "info", f"tool: browser_humanlike_click session={session_id}")
+    if not selector and not ref and (x is None or y is None):
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.INVALID_INPUT, "selector, ref, or x/y required").to_dict()
+    session = await manager.get_session(session_id)
+    if not session:
+        return ToolResult.fail(session_id, tab_id, ErrorCodes.SESSION_NOT_FOUND, "session not found").to_dict()
+    async with session.lock:
+        try:
+            rec = _find_tab(session, tab_id)
+            # Resolve target coordinates
+            target_x: float = 0.0
+            target_y: float = 0.0
+
+            if x is not None and y is not None:
+                target_x, target_y = float(x), float(y)
+            elif selector:
+                box = await _evaluate(rec.tab, f"""
+                    (function(){{
+                        const el = document.querySelector({_js_value(selector)});
+                        if (!el) return null;
+                        const r = el.getBoundingClientRect();
+                        return {{x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height}};
+                    }})()
+                """)
+                if not box or not isinstance(box, dict):
+                    raise RuntimeError(f"element not found: {selector}")
+                # Randomize within element bounds (avoid exact center)
+                offset_x = (random.random() - 0.5) * min(box.get("w", 10), 20)
+                offset_y = (random.random() - 0.5) * min(box.get("h", 10), 10)
+                target_x = float(box["x"]) + offset_x
+                target_y = float(box["y"]) + offset_y
+            elif ref:
+                remote_obj = await _resolve_ref(session, rec.tab_id, ref, rec.tab)
+                import nodriver.cdp.runtime as cdp_runtime
+                send = getattr(rec.tab, "send", None)
+                box_result, _ = await _safe_call(send, cdp_runtime.call_function_on(
+                    function_declaration="function(){const r=this.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height};}",
+                    object_id=remote_obj.object_id,
+                    return_by_value=True,
+                ))
+                if box_result and box_result.value:
+                    bv = box_result.value
+                    offset_x = (random.random() - 0.5) * min(float(bv.get("w", 10)), 20)
+                    offset_y = (random.random() - 0.5) * min(float(bv.get("h", 10)), 10)
+                    target_x = float(bv["x"]) + offset_x
+                    target_y = float(bv["y"]) + offset_y
+
+            # Generate Bezier curve from current start (0,0) to target
+            import nodriver.cdp.input_ as cdp_input
+            send = getattr(rec.tab, "send", None)
+            if not callable(send):
+                raise RuntimeError("tab.send not available")
+
+            # Control points for quadratic Bezier
+            start_x = random.uniform(target_x * 0.3, target_x * 0.7)
+            start_y = random.uniform(target_y * 0.3, target_y * 0.7)
+            cp_x = random.uniform(min(start_x, target_x), max(start_x, target_x))
+            cp_y = random.uniform(min(start_y, target_y) - 50, max(start_y, target_y) + 50)
+
+            steps = max(5, min(steps, 30))
+            for step in range(steps + 1):
+                t = step / steps
+                # Quadratic Bezier: B(t) = (1-t)^2*P0 + 2(1-t)t*P1 + t^2*P2
+                mx = (1 - t) ** 2 * start_x + 2 * (1 - t) * t * cp_x + t ** 2 * target_x
+                my = (1 - t) ** 2 * start_y + 2 * (1 - t) * t * cp_y + t ** 2 * target_y
+                await _safe_call(send, cdp_input.dispatch_mouse_event(
+                    type_="mouseMoved",
+                    x=mx,
+                    y=my,
+                ))
+                if step < steps:
+                    await asyncio.sleep(random.uniform(0.005, 0.02))
+
+            # Press
+            press_delay = random.uniform(0.05, 0.15)
+            await _safe_call(send, cdp_input.dispatch_mouse_event(
+                type_="mousePressed",
+                x=target_x,
+                y=target_y,
+                button=cdp_input.MouseButton.LEFT if button == "left" else cdp_input.MouseButton.RIGHT,
+                click_count=1,
+            ))
+            await asyncio.sleep(press_delay)
+            # Release
+            await _safe_call(send, cdp_input.dispatch_mouse_event(
+                type_="mouseReleased",
+                x=target_x,
+                y=target_y,
+                button=cdp_input.MouseButton.LEFT if button == "left" else cdp_input.MouseButton.RIGHT,
+                click_count=1,
+            ))
+            return ToolResult(ok=True, session_id=session_id, tab_id=rec.tab_id, data={
+                "x": target_x, "y": target_y, "steps": steps, "button": button,
+            }).to_dict()
+        except Exception as exc:
+            return ToolResult.fail(session_id, rec.tab_id if "rec" in locals() else tab_id, ErrorCodes.INTERNAL, str(exc)).to_dict()
 
 
 @mcp.tool()
